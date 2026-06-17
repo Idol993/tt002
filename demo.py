@@ -76,25 +76,27 @@ class RobustTrainer:
 
         self.scheduler = ChaoticTrainingScheduler(
             seed=42,
-            base_interval=20,
-            min_interval=8,
-            max_interval=50,
-            chaos_strength=0.4,
-            warmup_steps=3,
+            base_interval=15,
+            min_interval=5,
+            max_interval=40,
+            chaos_strength=0.3,
+            warmup_steps=20,
         )
 
         self.compensator = FastAdaptationCompensator(
-            compensation_strength=1.0,
+            compensation_strength=1.5,
             kl_temperature=1.0,
             ema_momentum=0.9,
-            max_compensation_epochs=20,
-            compensation_lr=0.005,
-            min_adaptation_steps=3,
+            max_compensation_epochs=25,
+            compensation_lr=0.01,
+            min_adaptation_steps=5,
             kl_aware_scaling=True,
+            max_kl_scale=2.5,
+            grad_clip=1.0,
         )
 
         self.meta_optimizer = MetaCycleOptimizer(
-            initial_frequency=1.0 / 30,
+            initial_frequency=1.0 / 15,
             initial_compensation=1.0,
             performance_threshold=0.02,
             meta_update_interval=2,
@@ -308,7 +310,7 @@ def main():
     dataset = create_synthetic_data(n_samples=1000, input_dim=trainer.dim, n_classes=trainer.n_classes)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
 
-    eval_dataset = create_synthetic_data(n_samples=300, input_dim=trainer.dim, n_classes=trainer.n_classes)
+    eval_dataset = create_synthetic_data(n_samples=500, input_dim=trainer.dim, n_classes=trainer.n_classes)
     eval_dataloader = DataLoader(eval_dataset, batch_size=32, shuffle=False)
 
     print("=" * 80)
@@ -321,7 +323,7 @@ def main():
     print(f"  Higher is better: {trainer.meta_optimizer.higher_is_better}")
     print()
 
-    base_epochs = 5
+    base_epochs = 4
     max_recovery_epochs = 10
     recovery_count = 0
     converged = False
@@ -419,7 +421,8 @@ def main():
     print()
     print(f"  Normal loss:           {final_robustness['avg_loss_normal']:.4f}")
     print(f"  Swapped loss:          {final_robustness['avg_loss_swapped']:.4f}")
-    print(f"  Performance drop:      {final_robustness['performance_degradation_pct']:.2f}%")
+    print(f"  Change:              {final_robustness['change_label']}")
+    print(f"  Degradation:         {final_robustness['performance_degradation_pct']:.2f}%")
     print(f"  Threshold:             {final_robustness['robustness_threshold_pct']:.0f}%")
     print(f"  Supersymmetry:         {final_robustness['supersymmetry_achieved']}")
     print()

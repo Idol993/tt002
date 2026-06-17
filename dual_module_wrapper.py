@@ -45,9 +45,10 @@ class DualModuleWrapper(nn.Module):
         self.module_a.load_state_dict(state_b)
         self.module_b.load_state_dict(state_a)
 
-        self._swapped = not self._swapped
-
         return {"pre_swap_a": state_a, "pre_swap_b": state_b}
+
+    def set_swapped(self, swapped: bool) -> None:
+        self._swapped = swapped
 
     def swap_optimizer_states(self, opt_a: torch.optim.Optimizer, opt_b: torch.optim.Optimizer) -> Dict:
         state_a_copy = copy.deepcopy(opt_a.state_dict())

@@ -30,8 +30,8 @@ class MetaCycleOptimizer:
         self.higher_is_better = higher_is_better
 
         self._reversal_count = 0
-        self._pre_reversal_metric: Optional[float] = None
-        self._post_reversal_metrics: List[float] = []
+        self._pending_pre_metric: Optional[float] = None
+        self._degradation_buffer: List[float] = []
         self._baseline_performance: Optional[float] = None
         self._ema_performance: Optional[float] = None
         self._meta_step = 0
@@ -53,13 +53,17 @@ class MetaCycleOptimizer:
             return max(0.0, relative_rise)
 
     def record_pre_reversal_metric(self, metric: float) -> None:
-        self._pre_reversal_metric = metric
+        self._pending_pre_metric = metric
 
     def record_post_reversal_metric(self, metric: float) -> None:
-        self._post_reversal_metrics.append(metric)
+        if self._pending_pre_metric is not None:
+            degradation = self._compute_degradation(metric, self._pending_pre_metric)
+            self._degradation_buffer.append(degradation)
+            self._pending_pre_metric = None
+
         self._reversal_count += 1
 
-        if self._reversal_count % self.meta_update_interval == 0:
+        if self._reversal_count % self.meta_update_interval == 0 and self._degradation_buffer:
             self._meta_update()
 
     def record_baseline_performance(self, performance: float) -> None:
@@ -73,17 +77,14 @@ class MetaCycleOptimizer:
         self._performance_history.append(performance)
 
     def _meta_update(self) -> None:
-        if self._pre_reversal_metric is None or not self._post_reversal_metrics:
+        if not self._degradation_buffer:
             return
 
-        recent_posts = self._post_reversal_metrics[-self.meta_update_interval:]
-        post_avg = np.mean(recent_posts)
+        avg_degradation = float(np.mean(self._degradation_buffer[-self.meta_update_interval:]))
+        self._degradation_history.append(avg_degradation)
 
-        degradation = self._compute_degradation(post_avg, self._pre_reversal_metric)
-        self._degradation_history.append(degradation)
-
-        freq_delta = self._compute_frequency_delta(degradation)
-        comp_delta = self._compute_compensation_delta(degradation)
+        freq_delta = self._compute_frequency_delta(avg_degradation)
+        comp_delta = self._compute_compensation_delta(avg_degradation)
 
         self.frequency = float(
             np.clip(
@@ -185,6 +186,8 @@ class MetaCycleOptimizer:
             "ema_decay": self.ema_decay,
             "higher_is_better": self.higher_is_better,
             "reversal_count": self._reversal_count,
+            "pending_pre_metric": self._pending_pre_metric,
+            "degradation_buffer": self._degradation_buffer,
             "baseline_performance": self._baseline_performance,
             "ema_performance": self._ema_performance,
             "meta_step": self._meta_step,
@@ -206,6 +209,8 @@ class MetaCycleOptimizer:
         self.ema_decay = state["ema_decay"]
         self.higher_is_better = state.get("higher_is_better", False)
         self._reversal_count = state["reversal_count"]
+        self._pending_pre_metric = state.get("pending_pre_metric", None)
+        self._degradation_buffer = state.get("degradation_buffer", [])
         self._baseline_performance = state["baseline_performance"]
         self._ema_performance = state["ema_performance"]
         self._meta_step = state["meta_step"]

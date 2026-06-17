@@ -15,6 +15,8 @@ class FastAdaptationCompensator:
         compensation_lr: float = 0.01,
         min_adaptation_steps: int = 3,
         kl_aware_scaling: bool = True,
+        max_kl_scale: float = 3.0,
+        grad_clip: float = 1.0,
     ):
         self.compensation_strength = compensation_strength
         self.kl_temperature = kl_temperature
@@ -23,6 +25,8 @@ class FastAdaptationCompensator:
         self.compensation_lr = compensation_lr
         self.min_adaptation_steps = min_adaptation_steps
         self.kl_aware_scaling = kl_aware_scaling
+        self.max_kl_scale = max_kl_scale
+        self.grad_clip = grad_clip
 
         self._pre_reversal_stats: Optional[Dict[str, torch.Tensor]] = None
         self._post_reversal_stats: Optional[Dict[str, torch.Tensor]] = None
@@ -76,7 +80,7 @@ class FastAdaptationCompensator:
             }
 
         kl_div = self._compute_kl_divergence()
-        self._current_kl = kl_div
+        self._current_kl = self._compute_combined_kl()
         return kl_div
 
     def _compute_kl_divergence(self) -> float:
@@ -104,6 +108,26 @@ class FastAdaptationCompensator:
         total_kl = sum(kl_values) / len(kl_values)
         self._kl_history.append(total_kl)
         return total_kl
+
+    def _compute_combined_kl(self) -> float:
+        if self._pre_reversal_stats is None or self._post_reversal_stats is None:
+            return 0.0
+
+        pre_mean = self._pre_reversal_stats["combined_mean"]
+        pre_std = self._pre_reversal_stats["combined_std"]
+        post_mean = self._post_reversal_stats["combined_mean"]
+        post_std = self._post_reversal_stats["combined_std"]
+
+        var_pre = (pre_std * self.kl_temperature) ** 2
+        var_post = (post_std * self.kl_temperature) ** 2
+
+        kl = 0.5 * (
+            (var_pre / var_post).log().mean()
+            + (var_post / var_pre).mean()
+            + ((pre_mean - post_mean) ** 2 / var_pre).mean()
+            - 1
+        )
+        return max(kl.item(), 0.0)
 
     def compute_kl_alignment_loss(
         self,
@@ -152,13 +176,19 @@ class FastAdaptationCompensator:
 
         kl_magnitude = kl_loss.item()
         if self.kl_aware_scaling and self._current_kl > 0:
-            scale_factor = 1.0 + self._current_kl
+            scale_factor = 1.0 + min(self._current_kl, self.max_kl_scale)
         else:
             scale_factor = 1.0
 
         effective_scale = self.compensation_strength * scale_factor
 
         compensation_grads = [-effective_scale * g for g in kl_grads]
+
+        if self.grad_clip > 0:
+            total_norm = torch.sqrt(sum(torch.sum(g ** 2) for g in compensation_grads))
+            if total_norm > self.grad_clip:
+                clip_coef = self.grad_clip / (total_norm + 1e-6)
+                compensation_grads = [g * clip_coef for g in compensation_grads]
 
         return compensation_grads, kl_magnitude
 
@@ -249,6 +279,8 @@ class FastAdaptationCompensator:
             "compensation_lr": self.compensation_lr,
             "min_adaptation_steps": self.min_adaptation_steps,
             "kl_aware_scaling": self.kl_aware_scaling,
+            "max_kl_scale": self.max_kl_scale,
+            "grad_clip": self.grad_clip,
             "ema_loss": self._ema_loss,
             "baseline_loss": self._baseline_loss,
             "current_kl": self._current_kl,
@@ -264,6 +296,8 @@ class FastAdaptationCompensator:
         self.compensation_lr = state["compensation_lr"]
         self.min_adaptation_steps = state["min_adaptation_steps"]
         self.kl_aware_scaling = state.get("kl_aware_scaling", True)
+        self.max_kl_scale = state.get("max_kl_scale", 3.0)
+        self.grad_clip = state.get("grad_clip", 1.0)
         self._ema_loss = state["ema_loss"]
         self._baseline_loss = state["baseline_loss"]
         self._current_kl = state.get("current_kl", 0.0)
