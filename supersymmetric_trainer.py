@@ -20,6 +20,8 @@ class SupersymmetricTrainer:
         base_optimizer_b: torch.optim.Optimizer,
         loss_fn: Callable,
         robustness_threshold: float = 0.02,
+        higher_is_better: bool = False,
+        adaptation_steps_per_reversal: int = 15,
         log_interval: int = 100,
     ):
         self.dual_wrapper = dual_wrapper
@@ -30,6 +32,8 @@ class SupersymmetricTrainer:
         self.opt_b = base_optimizer_b
         self.loss_fn = loss_fn
         self.robustness_threshold = robustness_threshold
+        self.higher_is_better = higher_is_better
+        self.adaptation_steps_per_reversal = adaptation_steps_per_reversal
         self.log_interval = log_interval
 
         self._global_step = 0
@@ -56,23 +60,10 @@ class SupersymmetricTrainer:
         self.opt_b.zero_grad()
         loss.backward()
 
-        if self.compensator._compensation_gradient_cache is not None:
-            all_params = self.dual_wrapper.get_all_params()
-            comp_grads = self.compensator._compensation_gradient_cache
-            with torch.no_grad():
-                for param, cg in zip(all_params, comp_grads):
-                    if param.grad is not None:
-                        param.grad.add_(cg)
-
         self.opt_a.step()
         self.opt_b.step()
 
-        self.compensator._ema_loss = (
-            loss.item()
-            if self.compensator._ema_loss is None
-            else self.compensator.ema_momentum * self.compensator._ema_loss
-            + (1 - self.compensator.ema_momentum) * loss.item()
-        )
+        self.compensator.update_ema_loss(loss.item())
 
         if self._reference_performance is None:
             self._reference_performance = loss.item()
@@ -91,7 +82,10 @@ class SupersymmetricTrainer:
         self, batch_input: torch.Tensor, batch_target: torch.Tensor
     ) -> Dict:
         self._reversal_count += 1
-        reversal_info: Dict = {"reversal_number": self._reversal_count, "step": self._global_step}
+        reversal_info: Dict = {
+            "reversal_number": self._reversal_count,
+            "step": self._global_step,
+        }
 
         with torch.no_grad():
             out_a, out_b = self.dual_wrapper.forward_separate(batch_input)
@@ -99,11 +93,11 @@ class SupersymmetricTrainer:
             pre_loss = self.loss_fn(combined_out, batch_target).item()
 
         self.compensator.capture_pre_reversal_state(out_a, out_b, combined_out, pre_loss)
-        self.meta_optimizer.record_pre_reversal_loss(pre_loss)
+        self.meta_optimizer.record_pre_reversal_metric(pre_loss)
         reversal_info["pre_reversal_loss"] = pre_loss
 
-        param_swap_info = self.dual_wrapper.swap_parameters()
-        opt_swap_info = self.dual_wrapper.swap_optimizer_states(self.opt_a, self.opt_b)
+        self.dual_wrapper.swap_parameters()
+        self.dual_wrapper.swap_optimizer_states(self.opt_a, self.opt_b)
         reversal_info["swapped"] = True
 
         with torch.no_grad():
@@ -113,38 +107,45 @@ class SupersymmetricTrainer:
         kl_div = self.compensator.capture_post_reversal_state(out_a_post, out_b_post, combined_out_post)
         reversal_info["kl_divergence"] = kl_div
 
-        post_loss = self.loss_fn(combined_out_post, batch_target).item()
-        reversal_info["post_reversal_loss"] = post_loss
-        self.meta_optimizer.record_post_reversal_loss(post_loss)
+        with torch.no_grad():
+            post_loss_before_adapt = self.loss_fn(combined_out_post, batch_target).item()
+        reversal_info["post_reversal_loss_before_adapt"] = post_loss_before_adapt
 
-        loss_spike = abs(post_loss - pre_loss) / (abs(pre_loss) + 1e-8)
-        self.scheduler.record_loss_spike(loss_spike)
-        reversal_info["loss_spike_ratio"] = loss_spike
+        loss_degradation = self._compute_raw_change(post_loss_before_adapt, pre_loss)
+        reversal_info["loss_degradation_pct"] = loss_degradation * 100
 
-        if loss_spike > self.compensator.spike_threshold:
-            adaptation_result = self.compensator.run_fast_adaptation(
-                self.dual_wrapper,
-                batch_input,
-                self.loss_fn,
-                batch_target,
-            )
-            reversal_info["adaptation"] = adaptation_result
+        adaptation_result = self.compensator.run_fast_adaptation(
+            self.dual_wrapper,
+            batch_input,
+            self.loss_fn,
+            batch_target,
+            n_steps=self.adaptation_steps_per_reversal,
+        )
+        reversal_info["adaptation"] = adaptation_result
+        reversal_info["post_reversal_loss_after_adapt"] = adaptation_result["final_loss"]
 
-        self._update_meta_cycle(loss_spike, post_loss)
+        effective_degradation = self._compute_raw_change(adaptation_result["final_loss"], pre_loss)
+        reversal_info["effective_degradation_pct"] = max(0.0, effective_degradation) * 100
+
+        self.meta_optimizer.record_post_reversal_metric(adaptation_result["final_loss"])
+
+        self.scheduler.update_frequency(self.meta_optimizer.frequency)
+        self.compensator.update_compensation_strength(self.meta_optimizer.compensation_strength)
 
         reversal_info["meta_frequency"] = self.meta_optimizer.frequency
         reversal_info["meta_compensation"] = self.meta_optimizer.compensation_strength
+        reversal_info["meta_mode"] = self.meta_optimizer.get_adjustment_direction()
 
         self._reversal_log.append(reversal_info)
         return reversal_info
 
-    def _update_meta_cycle(self, loss_spike: float, post_reversal_loss: float) -> None:
-        current_performance = post_reversal_loss
-
-        self.meta_optimizer.record_baseline_performance(current_performance)
-
-        self.scheduler.update_frequency(self.meta_optimizer.frequency)
-        self.compensator.update_compensation_strength(self.meta_optimizer.compensation_strength)
+    def _compute_raw_change(self, current: float, baseline: float) -> float:
+        if baseline <= 0:
+            return 0.0
+        if self.higher_is_better:
+            return (baseline - current) / baseline
+        else:
+            return (current - baseline) / baseline
 
     def evaluate_robustness(self, eval_dataloader) -> Dict:
         self.dual_wrapper.eval()
@@ -159,32 +160,51 @@ class SupersymmetricTrainer:
                 total_loss_normal += loss_normal
 
                 current_swap_state = self.dual_wrapper.is_swapped
-                self.dual_wrapper._swapped = not current_swap_state
+                self.dual_wrapper.set_swapped(not current_swap_state)
                 out_swapped, _ = self.dual_wrapper.forward_with_intermediate(batch_input)
                 loss_swapped = self.loss_fn(out_swapped, batch_target).item()
                 total_loss_swapped += loss_swapped
 
-                self.dual_wrapper._swapped = current_swap_state
+                self.dual_wrapper.set_swapped(current_swap_state)
                 n_batches += 1
 
         self.dual_wrapper.train()
 
         avg_normal = total_loss_normal / max(n_batches, 1)
         avg_swapped = total_loss_swapped / max(n_batches, 1)
-        performance_drop = abs(avg_swapped - avg_normal) / (avg_normal + 1e-8)
-        is_robust = performance_drop <= self.robustness_threshold
+
+        raw_change = self._compute_raw_change(avg_swapped, avg_normal)
+
+        performance_degradation = max(0.0, raw_change)
+        is_robust = performance_degradation <= self.robustness_threshold
+
+        if raw_change < -0.001:
+            change_label = f"IMPROVED by {-raw_change*100:.2f}%"
+        elif raw_change <= 0.001:
+            change_label = "no change"
+        else:
+            change_label = f"DEGRADED by {raw_change*100:.2f}%"
+
+        metric_direction = (
+            "higher_is_better (accuracy)"
+            if self.higher_is_better
+            else "lower_is_better (loss)"
+        )
 
         return {
             "avg_loss_normal": avg_normal,
             "avg_loss_swapped": avg_swapped,
-            "performance_drop": performance_drop,
-            "performance_drop_pct": performance_drop * 100,
+            "raw_change": raw_change,
+            "performance_degradation": performance_degradation,
+            "performance_degradation_pct": performance_degradation * 100,
+            "change_label": change_label,
             "is_robust": is_robust,
             "robustness_threshold_pct": self.robustness_threshold * 100,
             "supersymmetry_achieved": is_robust,
+            "metric_direction": metric_direction,
         }
 
-    def train_epoch(self, dataloader, epoch: int = 0) -> Dict:
+    def train_epoch(self, dataloader, epoch: int = 0, verbose: bool = True) -> Dict:
         self.dual_wrapper.train()
         epoch_losses = []
         epoch_reversals = 0
@@ -194,6 +214,8 @@ class SupersymmetricTrainer:
             epoch_losses.append(step_info["loss"])
             if "reversal" in step_info:
                 epoch_reversals += 1
+                if verbose:
+                    self._print_reversal(step_info["reversal"])
 
         avg_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
         return {
@@ -205,6 +227,21 @@ class SupersymmetricTrainer:
             "current_frequency": self.meta_optimizer.frequency,
             "current_compensation": self.meta_optimizer.compensation_strength,
         }
+
+    def _print_reversal(self, r: Dict) -> None:
+        a = r["adaptation"]
+        print(f"  [REVERSAL #{r['reversal_number']}] step={r['step']}")
+        print(f"    pre_loss={r['pre_reversal_loss']:.4f}  ->  "
+              f"post_loss={r['post_reversal_loss_before_adapt']:.4f}")
+        print(f"    KL divergence: {r['kl_divergence']:.6f}")
+        print(f"    Degradation before adapt: {r['loss_degradation_pct']:.2f}%")
+        print(f"    Adaptation: {a['adaptation_steps']} steps, "
+              f"loss: {a['initial_loss']:.4f} -> {a['final_loss']:.4f} "
+              f"(-{a['loss_reduction_pct']:.1f}%)")
+        print(f"    Effective degradation: {r['effective_degradation_pct']:.2f}%")
+        print(f"    Meta mode: {r['meta_mode']} | "
+              f"freq={r['meta_frequency']:.5f} | "
+              f"comp={r['meta_compensation']:.4f}")
 
     def get_training_summary(self) -> Dict:
         return {
